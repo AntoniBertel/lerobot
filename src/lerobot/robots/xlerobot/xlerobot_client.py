@@ -24,10 +24,11 @@ import cv2
 import numpy as np
 import zmq
 
-from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..robot import Robot
-from .config_xlerobot import XLerobotConfig, XLerobotClientConfig
+from .xlerobot_base_keyboard import BaseKeyboardController
+from .xlerobot_config import XLerobotConfig, XLerobotClientConfig
 
 
 class XLerobotClient(Robot):
@@ -45,6 +46,7 @@ class XLerobotClient(Robot):
         self.port_zmq_observations = config.port_zmq_observations
 
         self.teleop_keys = config.teleop_keys
+        self.base_keyboard = BaseKeyboardController(self.teleop_keys)
 
         self.polling_timeout_ms = config.polling_timeout_ms
         self.connect_timeout_s = config.connect_timeout_s
@@ -56,14 +58,6 @@ class XLerobotClient(Robot):
         self.last_frames = {}
 
         self.last_remote_state = {}
-
-        # Define three speed levels and a current index
-        self.speed_levels = [
-            {"xy": 0.1, "theta": 30},  # slow
-            {"xy": 0.2, "theta": 60},  # medium
-            {"xy": 0.3, "theta": 90},  # fast
-        ]
-        self.speed_index = 0  # Start at slow
 
         self._is_connected = False
         self.logs = {}
@@ -92,13 +86,13 @@ class XLerobotClient(Robot):
             ),
             float,
         )
-        
+
     @cached_property
     def _state_order(self) -> tuple[str, ...]:
         return tuple(self._state_ft.keys())
 
     @cached_property
-    def _cameras_ft(self) -> dict[str, tuple[int, int, int]]:
+    def _cameras_ft(self) -> dict[str, tuple[int | None, int | None, int]]:
         return {name: (cfg.height, cfg.width, 3) for name, cfg in self.config.cameras.items()}
 
     @cached_property
@@ -122,7 +116,7 @@ class XLerobotClient(Robot):
 
         if self._is_connected:
             raise DeviceAlreadyConnectedError(
-                "LeKiwi Daemon is already connected. Do not run `robot.connect()` twice."
+                "XLerobot client is already connected. Do not run `robot.connect()` twice."
             )
 
         self.zmq_context = zmq.Context()
@@ -140,7 +134,7 @@ class XLerobotClient(Robot):
         poller.register(self.zmq_observation_socket, zmq.POLLIN)
         socks = dict(poller.poll(self.connect_timeout_s * 1000))
         if self.zmq_observation_socket not in socks or socks[self.zmq_observation_socket] != zmq.POLLIN:
-            raise DeviceNotConnectedError("Timeout waiting for LeKiwi Host to connect expired.")
+            raise DeviceNotConnectedError("Timeout waiting for XLerobot Host to connect expired.")
 
         self._is_connected = True
 
@@ -262,7 +256,7 @@ class XLerobotClient(Robot):
         and a camera frame. Receives over ZMQ, translate to body-frame vel
         """
         if not self._is_connected:
-            raise DeviceNotConnectedError("LeKiwiClient is not connected. You need to run `robot.connect()`.")
+            raise DeviceNotConnectedError("XLerobotClient is not connected. You need to run `robot.connect()`.")
 
         frames, obs_dict = self._get_data()
 
@@ -276,45 +270,13 @@ class XLerobotClient(Robot):
         return obs_dict
 
     def _from_keyboard_to_base_action(self, pressed_keys: np.ndarray):
-        # Speed control
-        if self.teleop_keys["speed_up"] in pressed_keys:
-            self.speed_index = min(self.speed_index + 1, 2)
-        if self.teleop_keys["speed_down"] in pressed_keys:
-            self.speed_index = max(self.speed_index - 1, 0)
-        speed_setting = self.speed_levels[self.speed_index]
-        xy_speed = speed_setting["xy"]  # e.g. 0.1, 0.25, or 0.4
-        theta_speed = speed_setting["theta"]  # e.g. 30, 60, or 90
-
-        x_cmd = 0.0  # m/s forward/backward
-        y_cmd = 0.0  # m/s lateral
-        theta_cmd = 0.0  # deg/s rotation
-
-        if self.teleop_keys["forward"] in pressed_keys:
-            x_cmd += xy_speed
-        if self.teleop_keys["backward"] in pressed_keys:
-            x_cmd -= xy_speed
-        if self.teleop_keys["left"] in pressed_keys:
-            y_cmd += xy_speed
-        if self.teleop_keys["right"] in pressed_keys:
-            y_cmd -= xy_speed
-        if self.teleop_keys["rotate_left"] in pressed_keys:
-            theta_cmd += theta_speed
-        if self.teleop_keys["rotate_right"] in pressed_keys:
-            theta_cmd -= theta_speed
-            
-        return {
-            # "head_motor_1.pos": 0.0,  # Head motors are not controlled by keyboard
-            # "head_motor_2.pos": 0.0,  # TODO: implement head control
-            "x.vel": x_cmd, 
-            "y.vel": y_cmd,
-            "theta.vel": theta_cmd,
-        }
+        return self.base_keyboard.compute_action(pressed_keys)
 
     def configure(self):
         pass
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        """Command lekiwi to move to a target joint configuration. Translates to motor space + sends over ZMQ
+        """Command xlerobot to move to a target joint configuration. Translates to motor space + sends over ZMQ
 
         Args:
             action (np.ndarray): array containing the goal positions for the motors.
@@ -327,8 +289,12 @@ class XLerobotClient(Robot):
         """
         if not self._is_connected:
             raise DeviceNotConnectedError(
-                "ManipulatorRobot is not connected. You need to run `robot.connect()`."
+                "ManipulatorRobot is not connected. You need to run `robot.connect()`"
             )
+
+        action = self.base_keyboard.augment_action(action)
+
+        logging.debug("XLerobotClient.send_action keys: %s", list(action.keys()))
 
         self.zmq_cmd_socket.send_string(json.dumps(action))  # action is in motor space
 
@@ -344,7 +310,7 @@ class XLerobotClient(Robot):
 
         if not self._is_connected:
             raise DeviceNotConnectedError(
-                "LeKiwi is not connected. You need to run `robot.connect()` before disconnecting."
+                "XLerobot client is not connected. You need to run `robot.connect()` before disconnecting."
             )
         self.zmq_observation_socket.close()
         self.zmq_cmd_socket.close()

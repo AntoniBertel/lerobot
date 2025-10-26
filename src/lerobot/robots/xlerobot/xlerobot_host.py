@@ -23,7 +23,7 @@ import cv2
 import zmq
 
 from .xlerobot import XLerobot
-from .config_xlerobot import XLerobotConfig, XLerobotHostConfig
+from .xlerobot_config import XLerobotConfig, XLerobotHostConfig
 
 
 class XLerobotHost:
@@ -63,7 +63,7 @@ def main():
     watchdog_active = False
     logging.info("Waiting for commands...")
     try:
-        # Business logic
+        # Loop
         start = time.perf_counter()
         duration = 0
         while duration < host.connection_time_s:
@@ -116,11 +116,11 @@ def main():
     except KeyboardInterrupt:
         print("Keyboard interrupt received. Exiting...")
     finally:
-        print("Shutting down Lekiwi Host.")
+        print("Shutting down XLerobot Host.")
         robot.disconnect()
         host.disconnect()
 
-    logging.info("Finished LeKiwi cleanly")
+    logging.info("Finished XLerobot host cleanly")
 
 
 if __name__ == "__main__":

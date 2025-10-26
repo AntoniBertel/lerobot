@@ -32,7 +32,9 @@ from lerobot.motors.feetech import (
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
-from .config_xlerobot import XLerobotConfig
+from .xlerobot_config import XLerobotConfig
+from .xlerobot_base_keyboard import BaseKeyboardController
+from .xlerobot_form_factor import ROBOT_PARTS, BUS_MAPPINGS, DEFAULT_IDS_BY_LAYOUT
 
 logger = logging.getLogger(__name__)
 
@@ -52,111 +54,89 @@ class XLerobot(Robot):
         super().__init__(config)
         self.config = config
         self.teleop_keys = config.teleop_keys
-        # Define three speed levels and a current index
-        self.speed_levels = [
-            {"xy": 0.1, "theta": 30},  # slow
-            {"xy": 0.2, "theta": 60},  # medium
-            {"xy": 0.3, "theta": 90},  # fast
-        ]
-        self.speed_index = 0  # Start at slow
-        norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
-        
-        # Extract calibration for each bus
-        calibration_left_arm = {
-            k: v for k, v in self.calibration.items() if k.startswith("left_arm_")
-        } if self.calibration else {}
-        
-        calibration_right_arm = {
-            k: v for k, v in self.calibration.items() if k.startswith("right_arm_")
-        } if self.calibration else {}
-        
-        calibration_head = {
-            k: v for k, v in self.calibration.items() if k.startswith("head_")
-        } if self.calibration else {}
-        
-        calibration_base = {
-            k: v for k, v in self.calibration.items() if k.startswith("base_")
-        } if self.calibration else {}
-        
-        # Bus 1: Left hand/arm
-        self.bus1 = FeetechMotorsBus(
-            port=self.config.port1,
-            motors={
-                "left_arm_shoulder_pan": Motor(1, "sts3215", norm_mode_body),
-                "left_arm_shoulder_lift": Motor(2, "sts3215", norm_mode_body),
-                "left_arm_elbow_flex": Motor(3, "sts3215", norm_mode_body),
-                "left_arm_wrist_flex": Motor(4, "sts3215", norm_mode_body),
-                "left_arm_wrist_roll": Motor(5, "sts3215", norm_mode_body),
-                "left_arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-            },
-            calibration=calibration_left_arm,
-        )
-        
-        # Bus 2: Right hand/arm
-        self.bus2 = FeetechMotorsBus(
-            port=self.config.port2,
-            motors={
-                "right_arm_shoulder_pan": Motor(1, "sts3215", norm_mode_body),
-                "right_arm_shoulder_lift": Motor(2, "sts3215", norm_mode_body),
-                "right_arm_elbow_flex": Motor(3, "sts3215", norm_mode_body),
-                "right_arm_wrist_flex": Motor(4, "sts3215", norm_mode_body),
-                "right_arm_wrist_roll": Motor(5, "sts3215", norm_mode_body),
-                "right_arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-            },
-            calibration=calibration_right_arm,
-        )
-        
-        # Bus 3: Neck and camera
-        self.bus3 = FeetechMotorsBus(
-            port=self.config.port3,
-            motors={
-                "head_motor_1": Motor(1, "sts3215", norm_mode_body),
-                "head_motor_2": Motor(2, "sts3215", norm_mode_body),
-            },
-            calibration=calibration_head,
-        )
-        
-        # Bus 4: Wheels
-        self.bus4 = FeetechMotorsBus(
-            port=self.config.port4,
-            motors={
-                "base_left_wheel": Motor(1, "sts3215", MotorNormMode.RANGE_M100_100),
-                "base_back_wheel": Motor(2, "sts3215", MotorNormMode.RANGE_M100_100),
-                "base_right_wheel": Motor(3, "sts3215", MotorNormMode.RANGE_M100_100),
-            },
-            calibration=calibration_base,
-        )
-        
-        self.left_arm_motors = list(self.bus1.motors.keys())
-        self.right_arm_motors = list(self.bus2.motors.keys())
-        self.head_motors = list(self.bus3.motors.keys())
-        self.base_motors = list(self.bus4.motors.keys())
-        self.cameras = make_cameras_from_configs(config.cameras)
+        self.base_keyboard = BaseKeyboardController(self.teleop_keys)
+
+        # Get bus mapping for the selected layout
+        bus_mapping = BUS_MAPPINGS[config.motor_layout]
+
+        # Build buses dynamically from robot parts + bus mapping
+        self.buses: dict[str, FeetechMotorsBus] = {}
+        self.motor_to_bus: dict[str, str] = {}  # motor_name -> bus_name
+        self.role_to_motors: dict[str, list[str]] = {}  # role -> list of motor names
+
+        motor_ids = dict(self.config.motor_ids)
+        layout_defaults = DEFAULT_IDS_BY_LAYOUT.get(self.config.motor_layout, {})
+        calibration_ids = {name: calib.id for name, calib in self.calibration.items()}
+
+        for bus_name, bus_config in bus_mapping.items():
+            port = config.ports.get(bus_config.port_key)
+            if not port:
+                continue
+
+            # Find motors that match this bus's patterns
+            bus_motors = {}
+            calibration_subset = {}
+
+            for motor_name, motor_def in ROBOT_PARTS.items():
+                # Check if this motor matches any pattern for this bus
+                matches = False
+                for pattern in bus_config.motor_patterns:
+                    if pattern.endswith("*"):
+                        prefix = pattern[:-1]
+                        if motor_name.startswith(prefix):
+                            matches = True
+                            break
+                    elif motor_name == pattern:
+                        matches = True
+                        break
+
+                if not matches:
+                    continue
+
+                # Create Motor object
+                norm_mode = motor_def.norm_mode if config.use_degrees else MotorNormMode.RANGE_M100_100
+                configured_id = motor_ids.get(motor_name)
+                if configured_id is not None:
+                    motor_id = configured_id
+                else:
+                    motor_id = calibration_ids.get(
+                        motor_name, layout_defaults.get(motor_name, motor_def.id)
+                    )
+                bus_motors[motor_name] = Motor(motor_id, motor_def.model, norm_mode)
+
+                # Track mappings
+                self.motor_to_bus[motor_name] = bus_name
+                if motor_def.role not in self.role_to_motors:
+                    self.role_to_motors[motor_def.role] = []
+                self.role_to_motors[motor_def.role].append(motor_name)
+
+                # Extract calibration
+                if self.calibration and motor_name in self.calibration:
+                    calibration_subset[motor_name] = self.calibration[motor_name]
+
+            # Create bus
+            self.buses[bus_name] = FeetechMotorsBus(
+                port=port,
+                motors=bus_motors,
+                calibration=calibration_subset,
+            )
+
+        self.cameras = make_cameras_from_configs(self.config.cameras)
 
     @property
     def _state_ft(self) -> dict[str, type]:
-        return dict.fromkeys(
-            (
-                "left_arm_shoulder_pan.pos",
-                "left_arm_shoulder_lift.pos",
-                "left_arm_elbow_flex.pos",
-                "left_arm_wrist_flex.pos",
-                "left_arm_wrist_roll.pos",
-                "left_arm_gripper.pos",
-                "right_arm_shoulder_pan.pos",
-                "right_arm_shoulder_lift.pos",
-                "right_arm_elbow_flex.pos",
-                "right_arm_wrist_flex.pos",
-                "right_arm_wrist_roll.pos",
-                "right_arm_gripper.pos",
-                "head_motor_1.pos",
-                "head_motor_2.pos",
-                "x.vel",
-                "y.vel",
-                "theta.vel",
-            ),
-            float,
-        )
+        keys = []
+
+        # Add position keys for arms and head
+        for role in ["left_arm", "right_arm", "head"]:
+            for motor_name in self.role_to_motors.get(role, []):
+                keys.append(f"{motor_name}.pos")
+
+        # Add velocity keys for base
+        if self.role_to_motors.get("base"):
+            keys.extend(["x.vel", "y.vel", "theta.vel"])
+
+        return dict.fromkeys(tuple(keys), float)
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
@@ -174,23 +154,16 @@ class XLerobot(Robot):
 
     @property
     def is_connected(self) -> bool:
-        return (
-            self.bus1.is_connected 
-            and self.bus2.is_connected 
-            and self.bus3.is_connected 
-            and self.bus4.is_connected 
-            and all(cam.is_connected for cam in self.cameras.values())
-        )
+        return (all(bus.is_connected for bus in self.buses.values()) and all(cam.is_connected for cam in self.cameras.values()))
 
     def connect(self, calibrate: bool = True) -> None:
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
-        self.bus1.connect()
-        self.bus2.connect()
-        self.bus3.connect()
-        self.bus4.connect()
-        
+        handshake = self.config.verify_motors_on_connect
+        for bus in self.buses.values():
+            bus.connect(handshake=handshake)
+
         if not self.is_calibrated and calibrate:
             self.calibrate()
 
@@ -202,200 +175,111 @@ class XLerobot(Robot):
 
     @property
     def is_calibrated(self) -> bool:
-        return (
-            self.bus1.is_calibrated 
-            and self.bus2.is_calibrated 
-            and self.bus3.is_calibrated 
-            and self.bus4.is_calibrated
-        )
+        return all(bus.is_calibrated for bus in self.buses.values())
 
     def calibrate(self) -> None:
         logger.info(f"\nRunning calibration of {self}")
-        
-        # Calibrate Bus 1: Left arm
-        self.bus1.disable_torque()
-        for name in self.left_arm_motors:
-            self.bus1.write("Operating_Mode", name, OperatingMode.POSITION.value)
-        input("Move left arm motors to the middle of their range of motion and press ENTER....")
-        homing_offsets_left = self.bus1.set_half_turn_homings(self.left_arm_motors)
-        
-        print(
-            "Move all left arm joints sequentially through their "
-            "entire ranges of motion.\nRecording positions. Press ENTER to stop..."
-        )
-        range_mins_left, range_maxes_left = self.bus1.record_ranges_of_motion(self.left_arm_motors)
-        
-        calibration_left = {}
-        for name, motor in self.bus1.motors.items():
-            calibration_left[name] = MotorCalibration(
-                id=motor.id,
-                drive_mode=0,
-                homing_offset=homing_offsets_left[name],
-                range_min=range_mins_left[name],
-                range_max=range_maxes_left[name],
-            )
-        self.bus1.write_calibration(calibration_left)
-        
-        # Calibrate Bus 2: Right arm
-        self.bus2.disable_torque()
-        for name in self.right_arm_motors:
-            self.bus2.write("Operating_Mode", name, OperatingMode.POSITION.value)
-        input("Move right arm motors to the middle of their range of motion and press ENTER....")
-        homing_offsets_right = self.bus2.set_half_turn_homings(self.right_arm_motors)
-        
-        print(
-            "Move all right arm joints sequentially through their "
-            "entire ranges of motion.\nRecording positions. Press ENTER to stop..."
-        )
-        range_mins_right, range_maxes_right = self.bus2.record_ranges_of_motion(self.right_arm_motors)
-        
-        calibration_right = {}
-        for name, motor in self.bus2.motors.items():
-            calibration_right[name] = MotorCalibration(
-                id=motor.id,
-                drive_mode=0,
-                homing_offset=homing_offsets_right[name],
-                range_min=range_mins_right[name],
-                range_max=range_maxes_right[name],
-            )
-        self.bus2.write_calibration(calibration_right)
-        
-        # Calibrate Bus 3: Head/neck motors
-        self.bus3.disable_torque()
-        for name in self.head_motors:
-            self.bus3.write("Operating_Mode", name, OperatingMode.POSITION.value)
-        input("Move head motors to the middle of their range of motion and press ENTER....")
-        homing_offsets_head = self.bus3.set_half_turn_homings(self.head_motors)
-        
-        print(
-            "Move all head joints sequentially through their "
-            "entire ranges of motion.\nRecording positions. Press ENTER to stop..."
-        )
-        range_mins_head, range_maxes_head = self.bus3.record_ranges_of_motion(self.head_motors)
-        
-        calibration_head = {}
-        for name, motor in self.bus3.motors.items():
-            calibration_head[name] = MotorCalibration(
-                id=motor.id,
-                drive_mode=0,
-                homing_offset=homing_offsets_head[name],
-                range_min=range_mins_head[name],
-                range_max=range_maxes_head[name],
-            )
-        self.bus3.write_calibration(calibration_head)
-        
-        # Calibrate Bus 4: Base wheels (full rotation motors, no homing offset needed)
-        # Wheels have full rotation capability
-        calibration_base = {}
-        for name, motor in self.bus4.motors.items():
-            calibration_base[name] = MotorCalibration(
-                id=motor.id,
-                drive_mode=0,
-                homing_offset=0,
-                range_min=0,
-                range_max=4095,
-            )
-        self.bus4.write_calibration(calibration_base)
-        
+
+        all_calibrations = {}
+
+        # Calibrate each role separately
+        for role in ["left_arm", "right_arm", "head", "base"]:
+            role_motors = self.role_to_motors.get(role, [])
+            if not role_motors:
+                continue
+
+            # Get the bus for the first motor of this role
+            first_motor = role_motors[0]
+            bus_name = self.motor_to_bus[first_motor]
+            bus = self.buses[bus_name]
+
+            if role == "base":
+                # Base wheels: simple calibration (full rotation)
+                calibration_role = {}
+                for motor_name in role_motors:
+                    motor = bus.motors[motor_name]
+                    calibration_role[motor_name] = MotorCalibration(
+                        id=motor.id,
+                        drive_mode=0,
+                        homing_offset=0,
+                        range_min=0,
+                        range_max=4095,
+                    )
+                bus.write_calibration(calibration_role)
+                all_calibrations.update(calibration_role)
+            else:
+                # Arms and head: full calibration process
+                bus.disable_torque()
+                for motor_name in role_motors:
+                    bus.write("Operating_Mode", motor_name, OperatingMode.POSITION.value)
+
+                input(f"Move {role} motors to the middle of their range of motion and press ENTER....")
+                homing_offsets = bus.set_half_turn_homings(role_motors)
+
+                print(f"Move all {role} joints sequentially through their "
+                      "entire ranges of motion.\nRecording positions. Press ENTER to stop...")
+                range_mins, range_maxes = bus.record_ranges_of_motion(role_motors)
+
+                calibration_role = {}
+                for motor_name in role_motors:
+                    motor = bus.motors[motor_name]
+                    calibration_role[motor_name] = MotorCalibration(
+                        id=motor.id,
+                        drive_mode=0,
+                        homing_offset=homing_offsets[motor_name],
+                        range_min=range_mins[motor_name],
+                        range_max=range_maxes[motor_name],
+                    )
+                bus.write_calibration(calibration_role)
+                all_calibrations.update(calibration_role)
+
         # Combine all calibrations and save
-        self.calibration = {**calibration_left, **calibration_right, **calibration_head, **calibration_base}
+        self.calibration = all_calibrations
         self._save_calibration()
         print("Calibration saved to", self.calibration_fpath)
-        
+
 
     def configure(self):
         # Set-up all actuators
         # We assume that at connection time, robot is in a rest position,
         # and torque can be safely disabled to run configuration
-        self.bus1.disable_torque()
-        self.bus2.disable_torque()
-        self.bus3.disable_torque()
-        self.bus4.disable_torque()
-        
-        self.bus1.configure_motors()
-        self.bus2.configure_motors()
-        self.bus3.configure_motors()
-        self.bus4.configure_motors()
-        
-        # Configure Bus 1: Left arm motors (position mode)
-        for name in self.left_arm_motors:
-            self.bus1.write("Operating_Mode", name, OperatingMode.POSITION.value)
-            # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-            self.bus1.write("P_Coefficient", name, 16)
-            # Set I_Coefficient and D_Coefficient to default value 0 and 32
-            self.bus1.write("I_Coefficient", name, 0)
-            self.bus1.write("D_Coefficient", name, 43)
-        
-        # Configure Bus 2: Right arm motors (position mode)
-        for name in self.right_arm_motors:
-            self.bus2.write("Operating_Mode", name, OperatingMode.POSITION.value)
-            # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-            self.bus2.write("P_Coefficient", name, 16)
-            # Set I_Coefficient and D_Coefficient to default value 0 and 32
-            self.bus2.write("I_Coefficient", name, 0)
-            self.bus2.write("D_Coefficient", name, 43)
-        
-        # Configure Bus 3: Head motors (position mode)
-        for name in self.head_motors:
-            self.bus3.write("Operating_Mode", name, OperatingMode.POSITION.value)
-            # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-            self.bus3.write("P_Coefficient", name, 16)
-            # Set I_Coefficient and D_Coefficient to default value 0 and 32
-            self.bus3.write("I_Coefficient", name, 0)
-            self.bus3.write("D_Coefficient", name, 43)
-        
-        # Configure Bus 4: Base wheel motors (velocity mode)
-        for name in self.base_motors:
-            self.bus4.write("Operating_Mode", name, OperatingMode.VELOCITY.value)
-        
+        for bus in self.buses.values():
+            bus.disable_torque()
+            bus.configure_motors()
+
+        # Configure each motor based on its role and definition
+        for motor_name, motor_def in ROBOT_PARTS.items():
+            if motor_name not in self.motor_to_bus:
+                continue
+
+            bus_name = self.motor_to_bus[motor_name]
+            bus = self.buses[bus_name]
+
+            # Set operating mode based on motor definition
+            if motor_def.operating_mode == "position":
+                bus.write("Operating_Mode", motor_name, OperatingMode.POSITION.value)
+                # Set PID for position mode
+                bus.write("P_Coefficient", motor_name, motor_def.pid_p)
+                bus.write("I_Coefficient", motor_name, motor_def.pid_i)
+                bus.write("D_Coefficient", motor_name, motor_def.pid_d)
+            elif motor_def.operating_mode == "velocity":
+                bus.write("Operating_Mode", motor_name, OperatingMode.VELOCITY.value)
+
         # Enable torque on all buses
-        self.bus1.enable_torque()
-        self.bus2.enable_torque()
-        self.bus3.enable_torque()
-        self.bus4.enable_torque()
-        
+        for bus in self.buses.values():
+            bus.enable_torque()
+
 
     def setup_motors(self) -> None:
-        # Setup Bus 1: Left arm motors (only if port1 is provided)
-        if self.config.port1:
-            print("\n=== Setting up Bus 1: Left Arm Motors ===")
-            for motor in reversed(self.left_arm_motors):
+        # Setup motors grouped by bus
+        for bus_name, bus in self.buses.items():
+            print(f"\n=== Setting up {bus_name} ===")
+            bus_motors = list(bus.motors.keys())
+            for motor in reversed(bus_motors):
                 input(f"Connect the controller board to the '{motor}' motor only and press enter.")
-                self.bus1.setup_motor(motor)
-                print(f"'{motor}' motor id set to {self.bus1.motors[motor].id}")
-        else:
-            print("\n⏭️  Skipping Bus 1 (Left Arm) - no port1 provided")
-        
-        # Setup Bus 2: Right arm motors (only if port2 is provided)
-        if self.config.port2:
-            print("\n=== Setting up Bus 2: Right Arm Motors ===")
-            for motor in reversed(self.right_arm_motors):
-                input(f"Connect the controller board to the '{motor}' motor only and press enter.")
-                self.bus2.setup_motor(motor)
-                print(f"'{motor}' motor id set to {self.bus2.motors[motor].id}")
-        else:
-            print("\n⏭️  Skipping Bus 2 (Right Arm) - no port2 provided")
-        
-        # Setup Bus 3: Head motors (only if port3 is provided)
-        if self.config.port3:
-            print("\n=== Setting up Bus 3: Head Motors ===")
-            for motor in reversed(self.head_motors):
-                input(f"Connect the controller board to the '{motor}' motor only and press enter.")
-                self.bus3.setup_motor(motor)
-                print(f"'{motor}' motor id set to {self.bus3.motors[motor].id}")
-        else:
-            print("\n⏭️  Skipping Bus 3 (Head) - no port3 provided")
-        
-        # Setup Bus 4: Base wheel motors (only if port4 is provided)
-        if self.config.port4:
-            print("\n=== Setting up Bus 4: Base Wheel Motors ===")
-            for motor in reversed(self.base_motors):
-                input(f"Connect the controller board to the '{motor}' motor only and press enter.")
-                self.bus4.setup_motor(motor)
-                print(f"'{motor}' motor id set to {self.bus4.motors[motor].id}")
-        else:
-            print("\n⏭️  Skipping Bus 4 (Base Wheels) - no port4 provided")
-        
+                bus.setup_motor(motor)
+                print(f"'{motor}' motor id set to {bus.motors[motor].id}")
+
 
     @staticmethod
     def _degps_to_raw(degps: float) -> int:
@@ -529,41 +413,9 @@ class XLerobot(Robot):
             "y.vel": y,
             "theta.vel": theta,
         }  # m/s and deg/s
-    
+
     def _from_keyboard_to_base_action(self, pressed_keys: np.ndarray):
-        # Speed control
-        if self.teleop_keys["speed_up"] in pressed_keys:
-            self.speed_index = min(self.speed_index + 1, 2)
-        if self.teleop_keys["speed_down"] in pressed_keys:
-            self.speed_index = max(self.speed_index - 1, 0)
-        speed_setting = self.speed_levels[self.speed_index]
-        xy_speed = speed_setting["xy"]  # e.g. 0.1, 0.25, or 0.4
-        theta_speed = speed_setting["theta"]  # e.g. 30, 60, or 90
-
-        x_cmd = 0.0  # m/s forward/backward
-        y_cmd = 0.0  # m/s lateral
-        theta_cmd = 0.0  # deg/s rotation
-
-        if self.teleop_keys["forward"] in pressed_keys:
-            x_cmd += xy_speed
-        if self.teleop_keys["backward"] in pressed_keys:
-            x_cmd -= xy_speed
-        if self.teleop_keys["left"] in pressed_keys:
-            y_cmd += xy_speed
-        if self.teleop_keys["right"] in pressed_keys:
-            y_cmd -= xy_speed
-        if self.teleop_keys["rotate_left"] in pressed_keys:
-            theta_cmd += theta_speed
-        if self.teleop_keys["rotate_right"] in pressed_keys:
-            theta_cmd -= theta_speed
-            
-        return {
-            # "head_motor_1.pos": 0.0,  # Head motors are not controlled by keyboard
-            # "head_motor_2.pos": 0.0,  # TODO: implement head control
-            "x.vel": x_cmd, 
-            "y.vel": y_cmd,
-            "theta.vel": theta_cmd,
-        }
+        return self.base_keyboard.compute_action(pressed_keys)
 
     def get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
@@ -571,22 +423,52 @@ class XLerobot(Robot):
 
         # Read actuators position for arms and head, velocity for base
         start = time.perf_counter()
-        left_arm_pos = self.bus1.sync_read("Present_Position", self.left_arm_motors)
-        right_arm_pos = self.bus2.sync_read("Present_Position", self.right_arm_motors)
-        head_pos = self.bus3.sync_read("Present_Position", self.head_motors)
-        base_wheel_vel = self.bus4.sync_read("Present_Velocity", self.base_motors)
-        
-        base_vel = self._wheel_raw_to_body(
-            base_wheel_vel["base_left_wheel"],
-            base_wheel_vel["base_back_wheel"],
-            base_wheel_vel["base_right_wheel"],
-        )
-        
-        left_arm_state = {f"{k}.pos": v for k, v in left_arm_pos.items()}
-        right_arm_state = {f"{k}.pos": v for k, v in right_arm_pos.items()}
-        head_state = {f"{k}.pos": v for k, v in head_pos.items()}
-        # Combine all arm and head states
-        obs_dict = {**left_arm_state, **right_arm_state, **head_state, **base_vel}
+
+        # Group motors by bus for efficient reading
+        bus_reads = {}
+        for role in ["left_arm", "right_arm", "head", "base"]:
+            role_motors = self.role_to_motors.get(role, [])
+            if not role_motors:
+                continue
+
+            # Group motors by bus
+            for motor_name in role_motors:
+                bus_name = self.motor_to_bus[motor_name]
+                if bus_name not in bus_reads:
+                    bus_reads[bus_name] = {"position": [], "velocity": []}
+
+                if role == "base":
+                    bus_reads[bus_name]["velocity"].append(motor_name)
+                else:
+                    bus_reads[bus_name]["position"].append(motor_name)
+
+        # Read from each bus
+        all_positions = {}
+        all_velocities = {}
+        for bus_name, motor_lists in bus_reads.items():
+            bus = self.buses[bus_name]
+            if motor_lists["position"]:
+                positions = bus.sync_read("Present_Position", motor_lists["position"])
+                all_positions.update(positions)
+            if motor_lists["velocity"]:
+                velocities = bus.sync_read("Present_Velocity", motor_lists["velocity"])
+                all_velocities.update(velocities)
+
+        # Convert base wheel velocities to body frame
+        base_vel = {}
+        base_motors = self.role_to_motors.get("base", [])
+        if base_motors and all_velocities:
+            base_vel = self._wheel_raw_to_body(
+                all_velocities.get("base_left_wheel", 0),
+                all_velocities.get("base_back_wheel", 0),
+                all_velocities.get("base_right_wheel", 0),
+            )
+
+        # Build observation dict
+        obs_dict = {}
+        for motor_name, pos in all_positions.items():
+            obs_dict[f"{motor_name}.pos"] = pos
+        obs_dict.update(base_vel)
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
@@ -601,7 +483,7 @@ class XLerobot(Robot):
         return obs_dict
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        """Command lekiwi to move to a target joint configuration.
+        """Command xlerobot to move to a target joint configuration.
 
         The relative action magnitude may be clipped depending on the configuration parameter
         `max_relative_target`. In this case, the action sent differs from original action.
@@ -615,60 +497,118 @@ class XLerobot(Robot):
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-        
-        left_arm_pos = {k: v for k, v in action.items() if k.startswith("left_arm_") and k.endswith(".pos")}
-        right_arm_pos = {k: v for k, v in action.items() if k.startswith("right_arm_") and k.endswith(".pos")}
-        head_pos = {k: v for k, v in action.items() if k.startswith("head_") and k.endswith(".pos")}
-        base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
-        base_wheel_goal_vel = self._body_to_wheel_raw(
-            base_goal_vel.get("x.vel", 0.0),
-            base_goal_vel.get("y.vel", 0.0),
-            base_goal_vel.get("theta.vel", 0.0),
-        )
-        
-        
+
+        action = self.base_keyboard.augment_action(action)
+
+        # Parse action by role
+        role_actions = {"left_arm": {}, "right_arm": {}, "head": {}, "base": {}}
+        base_goal_vel = {}
+
+        for key, value in action.items():
+            if key.endswith(".pos"):
+                motor_name = key.replace(".pos", "")
+                for role in ["left_arm", "right_arm", "head"]:
+                    if motor_name in self.role_to_motors.get(role, []):
+                        role_actions[role][key] = value
+                        break
+            elif key.endswith(".vel"):
+                base_goal_vel[key] = value
+
+        # Convert base velocities to wheel commands
+        base_wheel_goal_vel = {}
+        if base_goal_vel:
+            base_wheel_goal_vel = self._body_to_wheel_raw(
+                base_goal_vel.get("x.vel", 0.0),
+                base_goal_vel.get("y.vel", 0.0),
+                base_goal_vel.get("theta.vel", 0.0),
+            )
+
+        # Safety clamping if configured
         if self.config.max_relative_target is not None:
-            # Read present positions for left arm, right arm, and head
-            present_pos_left = self.bus1.sync_read("Present_Position", self.left_arm_motors)
-            present_pos_right = self.bus2.sync_read("Present_Position", self.right_arm_motors)
-            present_pos_head = self.bus3.sync_read("Present_Position", self.head_motors)
+            # Read present positions for all position-controlled motors
+            present_pos = {}
+            for role in ["left_arm", "right_arm", "head"]:
+                role_motors = self.role_to_motors.get(role, [])
+                if not role_motors:
+                    continue
 
-            # Combine all present positions
-            present_pos = {**present_pos_left, **present_pos_right, **present_pos_head}
+                # Get bus for first motor of this role
+                first_motor = role_motors[0]
+                bus_name = self.motor_to_bus[first_motor]
+                bus = self.buses[bus_name]
 
-            # Ensure safe goal position for each arm and head
-            goal_present_pos = {
-                key: (g_pos, present_pos[key]) for key, g_pos in chain(left_arm_pos.items(), right_arm_pos.items(), head_pos.items())
-            }
-            safe_goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
+                # Read positions for all motors of this role
+                positions = bus.sync_read("Present_Position", role_motors)
+                present_pos.update(positions)
 
-            # Update the action with the safe goal positions
-            left_arm_pos = {k: v for k, v in safe_goal_pos.items() if k in left_arm_pos}
-            right_arm_pos = {k: v for k, v in safe_goal_pos.items() if k in right_arm_pos}
-            head_pos = {k: v for k, v in safe_goal_pos.items() if k in head_pos}
-        
-        left_arm_pos_raw = {k.replace(".pos", ""): v for k, v in left_arm_pos.items()}
-        right_arm_pos_raw = {k.replace(".pos", ""): v for k, v in right_arm_pos.items()}
-        head_pos_raw = {k.replace(".pos", ""): v for k, v in head_pos.items()}
-        
-        # Only sync_write if there are motors to write to
-        if left_arm_pos_raw:
-            self.bus1.sync_write("Goal_Position", left_arm_pos_raw)
-        if right_arm_pos_raw:
-            self.bus2.sync_write("Goal_Position", right_arm_pos_raw)
-        if head_pos_raw:
-            self.bus3.sync_write("Goal_Position", head_pos_raw)
+            # Apply safety clamping
+            goal_present_pos = {}
+            for role in ["left_arm", "right_arm", "head"]:
+                for key, value in role_actions[role].items():
+                    motor_name = key.replace(".pos", "")
+                    if motor_name in present_pos:
+                        goal_present_pos[key] = (value, present_pos[motor_name])
+
+            if goal_present_pos:
+                safe_goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
+                # Update role actions with safe positions
+                for key, safe_value in safe_goal_pos.items():
+                    motor_name = key.replace(".pos", "")
+                    for role in ["left_arm", "right_arm", "head"]:
+                        if motor_name in self.role_to_motors.get(role, []):
+                            role_actions[role][key] = safe_value
+                            break
+
+        # Group actions by bus for efficient writing
+        bus_writes = {}
+        for role in ["left_arm", "right_arm", "head"]:
+            role_motors = self.role_to_motors.get(role, [])
+            if not role_motors:
+                continue
+
+            # Group by bus
+            for key, value in role_actions[role].items():
+                motor_name = key.replace(".pos", "")
+                bus_name = self.motor_to_bus[motor_name]
+                if bus_name not in bus_writes:
+                    bus_writes[bus_name] = {}
+                bus_writes[bus_name][motor_name] = value
+
+        # Add base wheel commands
         if base_wheel_goal_vel:
-            self.bus4.sync_write("Goal_Velocity", base_wheel_goal_vel)
-        return {
-            **left_arm_pos,
-            **right_arm_pos,
-            **head_pos,
-            **base_goal_vel,
-        }
+            base_motors = self.role_to_motors.get("base", [])
+            for motor_name in base_motors:
+                bus_name = self.motor_to_bus[motor_name]
+                if bus_name not in bus_writes:
+                    bus_writes[bus_name] = {}
+                bus_writes[bus_name][motor_name] = base_wheel_goal_vel.get(motor_name, 0)
+
+        # Write to buses
+        base_motors = self.role_to_motors.get("base", [])
+        for bus_name, commands in bus_writes.items():
+            bus = self.buses[bus_name]
+            if any(motor in base_motors for motor in commands.keys()):
+                # Base motors use velocity commands
+                bus.sync_write("Goal_Velocity", commands)
+            else:
+                # Other motors use position commands
+                bus.sync_write("Goal_Position", commands)
+
+        # Return the action that was sent
+        result = {}
+        for role_actions_dict in role_actions.values():
+            result.update(role_actions_dict)
+        result.update(base_goal_vel)
+        return result
 
     def stop_base(self):
-        self.bus4.sync_write("Goal_Velocity", dict.fromkeys(self.base_motors, 0), num_retry=5)
+        base_motors = self.role_to_motors.get("base", [])
+        if base_motors:
+            # Find the bus for base motors
+            first_base_motor = base_motors[0]
+            bus_name = self.motor_to_bus[first_base_motor]
+            bus = self.buses[bus_name]
+            bus.sync_write("Goal_Velocity", dict.fromkeys(base_motors, 0), num_retry=5)
         logger.info("Base motors stopped")
 
     def disconnect(self):
@@ -676,10 +616,8 @@ class XLerobot(Robot):
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         self.stop_base()
-        self.bus1.disconnect(self.config.disable_torque_on_disconnect)
-        self.bus2.disconnect(self.config.disable_torque_on_disconnect)
-        self.bus3.disconnect(self.config.disable_torque_on_disconnect)
-        self.bus4.disconnect(self.config.disable_torque_on_disconnect)
+        for bus in self.buses.values():
+            bus.disconnect(self.config.disable_torque_on_disconnect)
         for cam in self.cameras.values():
             cam.disconnect()
 
